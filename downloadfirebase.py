@@ -1,71 +1,132 @@
-# Opens files in directory, outputs firebase URLs to a file, downloads them, and replaces the links with a link to the new files.
-# To use, replace PATH in the variable vaultDir with your vault's root directory.
-# This automatically puts filenames in /assets - change the newFilePath variable if you want to change this
-
-import re
-import glob
 import os
+import re
 import requests
-import calendar
-import time
-from io import BytesIO
+import urllib.parse
 
-vaultDir = '/Users/nic/Desktop/test2021'
+# ==============================
+# CONFIGURATION (EDIT THESE)
+# ==============================
 
-firebaseShort = 'none'
-fullRead = 'none'
-fileFullPath = ''
-fullTempFilePath = ''
-i = 0
-ext = ''
+vaultDir = '/path/to/your/obsidian/vault'   # ← change this
+assetsFolderName = 'Assets'          # ← change if needed
 
-# Walk through all files in all directories within the specified vault directory
-for subdir, dirs, files in os.walk(vaultDir):
-    for file in files:
-        # Open file in directory
-        fileFullPath = os.path.join(subdir,file)
-        fhand = open(fileFullPath, errors='ignore')
-        for line in fhand:
-            # Download the Firebase file and save it in the assets folder
-            if 'firebasestorage' in line:
-                try:
-                    # If it's a PDF, it will be in the format {{pdf: link}}
-                    if '{{pdf:' in line:
-                        link = re.search(r'https://firebasestorage(.*)\?alt(.*)\}', line)
-                    else:
-                        link = re.search(r'https://firebasestorage(.*)\?alt(.*)\)', line)
-                    firebaseShort = 'https://firebasestorage' + link.group(1) # https://firebasestorage.googleapis.com/v0/b/firescript-577a2.appspot.com/o/imgs%2Fapp%2FDownloadMyBrain%2FLy4Wel-rjk.png
-                    firebaseUrl = link.group(0)[:-1] # https://firebasestorage.googleapis.com/v0/b/firescript-577a2.appspot.com/o/imgs%2Fapp%2FDownloadMyBrain%2FLy4Wel-rjk.png?alt=media&token=0fbafc8f-0a47-4720-9e68-88f70803ced6
-                    # Download the file locally
-                    r = requests.get(firebaseUrl)
-                    timestamp = calendar.timegm(time.gmtime())
-                    # Get file extension of file. Ex: .png; .jpeg
-                    reg = re.search(r'(.*)\.(.+)', firebaseShort[-5:]) # a.png / .jpeg
-                    ext = '.' + reg.group(2) # .jpeg
-                    # Create assets folder if it doesn't exist
-                    if not os.path.exists(vaultDir + '/assets'):
-                        os.makedirs(vaultDir + '/assets')
-                    # Create new local file out of downloaded firebase file
-                    newFilePath = 'assets/' + str(timestamp) + '_' + str(i) + ext
-                    # print(firebaseUrl + '>>>' + newFilePath)
-                    with open(vaultDir + '/' + newFilePath,'wb') as output_file:
-                        shutil.copyfileobj(BytesIO(r.content), output_file)
-                except AttributeError: # This is to prevent the AttributeError exception when no matches are returned
-                    continue
-                # Save Markdown file with new local file link as a temp file
-                # If there is already a temp version of a file, open that.
-                fullTempFilePath = vaultDir + '/temp_' + file
-                if os.path.exists(fullTempFilePath):
-                    fullRead = open(fullTempFilePath, errors='ignore')
-                else:
-                    fullRead = open(fileFullPath, errors='ignore')
-                data = fullRead.read()
-                data = data.replace(firebaseUrl,newFilePath)
-                with open(fullTempFilePath,'wt') as temp_file:
-                    temp_file.write(data)
-                    i = i + 1
-                if os.path.exists(fullTempFilePath):
-                    path = os.replace(fullTempFilePath,fileFullPath)
-                fullRead.close()
-        # Close file
-        fhand.close()
+# ==============================
+
+assetsDir = os.path.join(vaultDir, assetsFolderName)
+os.makedirs(assetsDir, exist_ok=True)
+
+# --- REGEX PATTERNS ---
+
+# Images with optional size: ![|300x200](URL)
+img_pattern = re.compile(r'!\[\|?([0-9x]*)\]\((https://firebasestorage[^\)]+)\)')
+
+# PDFs: {{pdf: URL}} OR {{[[pdf]]: URL}}
+pdf_pattern = re.compile(r'\{\{\s*(?:\[\[pdf\]\]|pdf)\s*:\s*(https://firebasestorage[^\}]+)\}\}')
+
+# Any remaining Firebase links
+raw_pattern = re.compile(r'(https://firebasestorage[^\s\)\}]+)')
+
+
+# --- EXTRACT FILENAME FROM FIREBASE URL ---
+def get_filename_from_url(url):
+    try:
+        path = re.search(r'/o/(.*?)\?', url).group(1)
+        decoded = urllib.parse.unquote(path)
+        return os.path.basename(decoded)
+    except:
+        return "file.bin"
+
+
+# --- DOWNLOAD FILE ---
+def download_file(url):
+    try:
+        r = requests.get(url, stream=True, timeout=10)
+        if r.status_code != 200:
+            print("❌ Failed:", url)
+            return None
+
+        filename = get_filename_from_url(url)
+        local_path = os.path.join(assetsDir, filename)
+
+        # Avoid overwriting existing files
+        base, ext = os.path.splitext(filename)
+        i = 1
+        while os.path.exists(local_path):
+            local_path = os.path.join(assetsDir, f"{base}_{i}{ext}")
+            i += 1
+
+        with open(local_path, 'wb') as f:
+            for chunk in r.iter_content(8192):
+                f.write(chunk)
+
+        return os.path.basename(local_path)
+
+    except Exception as e:
+        print("⚠️ Error:", url, e)
+        return None
+
+
+# --- MAIN PROCESS ---
+
+for root, _, files in os.walk(vaultDir):
+    for fname in files:
+
+        file_path = os.path.join(root, fname)
+
+        # Skip attachments folder to avoid reprocessing
+        if assetsFolderName in file_path:
+            continue
+
+        try:
+            with open(file_path, encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+        except:
+            continue
+
+        original_content = content
+
+        # --- IMAGES ---
+        for match in img_pattern.finditer(content):
+            size, url = match.groups()
+
+            filename = download_file(url)
+            if not filename:
+                continue
+
+            new_link = f"![[{assetsFolderName}/{filename}"
+            if size:
+                new_link += f"|{size}"
+            new_link += "]]"
+
+            content = content.replace(match.group(0), new_link)
+
+        # --- PDFs ---
+        for match in pdf_pattern.finditer(content):
+            url = match.group(1)
+
+            filename = download_file(url)
+            if not filename:
+                continue
+
+            new_link = f"![[{assetsFolderName}/{filename}]]"
+            content = content.replace(match.group(0), new_link)
+
+        # --- RAW LINKS (fallback) ---
+        for url in raw_pattern.findall(content):
+            if url not in content:
+                continue
+
+            filename = download_file(url)
+            if not filename:
+                continue
+
+            new_link = f"![[{assetsFolderName}/{filename}]]"
+            content = content.replace(url, new_link)
+
+        # --- SAVE FILE IF MODIFIED ---
+        if content != original_content:
+            print("Updated:", file_path)
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+print("\n✅ Done.")
